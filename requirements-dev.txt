@@ -1,0 +1,6 @@
+-r airflow/requirements.txt
+-r api/requirements.txt
+pytest>=8.1.0
+pytest-mock>=3.14.0
+bandit>=1.7.8
+pip-audit>=2.7.2

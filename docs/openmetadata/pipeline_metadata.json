@@ -1,0 +1,128 @@
+{
+  "$schema": "https://open-metadata.org/schema/metadataIngestion/lineage.json",
+  "serviceName": "sismowatch_data_platform",
+  "description": "Especificación formal de linaje de datos y catálogo de metadatos de SismoWatch (Arquitectura Medallion)",
+  "nodes": [
+    {
+      "id": "source.usgs_api",
+      "type": "apiService",
+      "name": "USGS Earthquake Feed API",
+      "description": "Feed público GeoJSON del Servicio Geológico de Estados Unidos (all_hour.geojson)",
+      "endpoint": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson",
+      "cadence": "Cada 5 minutos",
+      "layer": "Source"
+    },
+    {
+      "id": "pipeline.airflow_ingest",
+      "type": "pipeline",
+      "name": "Airflow: dag_usgs_ingest_raw",
+      "description": "Extracción idempotente, cálculo de hash SHA-256 y replicación dual (MinIO + Postgres)",
+      "schedule": "*/5 * * * *",
+      "layer": "Orchestration"
+    },
+    {
+      "id": "lake.minio_raw",
+      "type": "storageService",
+      "name": "MinIO S3 Data Lake (Bronze)",
+      "description": "Almacenamiento inmutable de GeoJSON crudos en s3://sismowatch-lake/raw/YYYY/MM/DD/",
+      "format": "GeoJSON",
+      "layer": "Bronze"
+    },
+    {
+      "id": "table.raw_usgs_earthquakes_raw",
+      "type": "table",
+      "name": "raw.usgs_earthquakes_raw",
+      "description": "Tabla de aterrizaje en PostgreSQL con payload crudo y deduplicación por payload_hash",
+      "columns": ["id", "batch_id", "feed_url", "payload_hash", "record_count", "raw_payload", "ingested_at"],
+      "layer": "Bronze"
+    },
+    {
+      "id": "pipeline.airflow_transform",
+      "type": "pipeline",
+      "name": "Airflow: dag_transform_and_quality",
+      "description": "Transformación, separación de coordenadas, validación con Pandera y upsert hacia Curated",
+      "trigger": "Triggered por dag_usgs_ingest_raw",
+      "layer": "Orchestration"
+    },
+    {
+      "id": "table.staging_earthquake_events_staging",
+      "type": "table",
+      "name": "staging.earthquake_events_staging",
+      "description": "Capa Silver: Tipado nativo (UTC), extracción [lon, lat, prof_km] y saneamiento",
+      "columns": ["id", "mag", "place", "time", "updated", "tsunami", "sig", "longitude", "latitude", "depth_km", "ingest_batch_id", "processed_at"],
+      "layer": "Silver"
+    },
+    {
+      "id": "gate.pandera_quality",
+      "type": "qualityGate",
+      "name": "Pandera Quality Gate",
+      "description": "Compuerta bloqueante: Valida rangos latitud [-90,90], longitud [-180,180], magnitud [-2,10], frescura y volumen",
+      "failure_action": "Descarte automático con auditoría en curated.data_quality_runs",
+      "layer": "Quality"
+    },
+    {
+      "id": "table.curated_earthquake_events",
+      "type": "table",
+      "name": "curated.earthquake_events",
+      "description": "Capa Gold: Catálogo consolidado final mediante upsert idempotente (ON CONFLICT (id) DO UPDATE)",
+      "columns": ["id", "mag", "place", "time", "updated", "tz", "url", "status", "tsunami", "sig", "mag_type", "type", "title", "longitude", "latitude", "depth_km", "is_updated", "created_at", "updated_at"],
+      "layer": "Gold"
+    },
+    {
+      "id": "table.curated_data_quality_runs",
+      "type": "table",
+      "name": "curated.data_quality_runs",
+      "description": "Auditoría de calidad: Registros evaluados, aprobados, rechazados y score_pct",
+      "columns": ["id", "dag_run_id", "rule_name", "records_evaluated", "records_passed", "records_failed", "score_pct", "status", "executed_at"],
+      "layer": "Gold"
+    },
+    {
+      "id": "pipeline.airflow_daily_ai",
+      "type": "pipeline",
+      "name": "Airflow: dag_daily_ai_report",
+      "description": "Cálculo de estadísticas SQL, Z-Score de enjambres y generación de narrativa ejecutiva con Ollama",
+      "schedule": "0 6 * * *",
+      "layer": "Orchestration"
+    },
+    {
+      "id": "table.curated_ai_executive_reports",
+      "type": "table",
+      "name": "curated.ai_executive_reports",
+      "description": "Reportes ejecutivos diarios redactados con IA y validados contra alucinaciones",
+      "columns": ["id", "report_date", "title", "summary_text", "top_regions", "metrics_snapshot", "generated_by_model", "created_at"],
+      "layer": "Gold"
+    },
+    {
+      "id": "service.fastapi_backend",
+      "type": "apiService",
+      "name": "SismoWatch Backend API (FastAPI)",
+      "description": "Servicio de consumo con rol sismo_app de solo lectura, autenticación JWT, RBAC y SSE",
+      "port": 8000,
+      "layer": "Consumption"
+    },
+    {
+      "id": "consumer.react_web",
+      "type": "dashboard",
+      "name": "SismoWatch Web Platform (React + Vite + Leaflet)",
+      "description": "Dashboard de mapas, KPIs, series temporales, reportes descargables y Chatbot Asistente IA",
+      "port": 3000,
+      "layer": "Consumption"
+    }
+  ],
+  "edges": [
+    {"from": "source.usgs_api", "to": "pipeline.airflow_ingest"},
+    {"from": "pipeline.airflow_ingest", "to": "lake.minio_raw"},
+    {"from": "pipeline.airflow_ingest", "to": "table.raw_usgs_earthquakes_raw"},
+    {"from": "table.raw_usgs_earthquakes_raw", "to": "pipeline.airflow_transform"},
+    {"from": "pipeline.airflow_transform", "to": "table.staging_earthquake_events_staging"},
+    {"from": "table.staging_earthquake_events_staging", "to": "gate.pandera_quality"},
+    {"from": "gate.pandera_quality", "to": "table.curated_earthquake_events"},
+    {"from": "gate.pandera_quality", "to": "table.curated_data_quality_runs"},
+    {"from": "table.curated_earthquake_events", "to": "pipeline.airflow_daily_ai"},
+    {"from": "pipeline.airflow_daily_ai", "to": "table.curated_ai_executive_reports"},
+    {"from": "table.curated_earthquake_events", "to": "service.fastapi_backend"},
+    {"from": "table.curated_data_quality_runs", "to": "service.fastapi_backend"},
+    {"from": "table.curated_ai_executive_reports", "to": "service.fastapi_backend"},
+    {"from": "service.fastapi_backend", "to": "consumer.react_web"}
+  ]
+}

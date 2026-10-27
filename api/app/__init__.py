@@ -1,0 +1,3 @@
+"""
+SismoWatch Backend API
+"""

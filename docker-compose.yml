@@ -1,0 +1,229 @@
+version: '3.8'
+
+services:
+  # ====================================================================
+  # 1. BASE DE DATOS POSTGRESQL (raw, staging, curated + roles)
+  # ====================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: sismowatch_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sismowatch}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_secure_pass_2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-sismowatch}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sismowatch_net
+
+  # ====================================================================
+  # 2. DATA LAKE OBJECT STORAGE: MINIO (S3 Lakehouse Medallion)
+  # ====================================================================
+  minio:
+    image: elestio/minio:latest
+    container_name: sismowatch_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_secret_pass_2026}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - sismowatch_net
+
+  # ====================================================================
+  # 3. APACHE AIRFLOW (LocalExecutor - Ingesta, Calidad, IA & Backfill)
+  # ====================================================================
+  airflow-init:
+    build:
+      context: ./airflow
+    container_name: sismowatch_airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-sismowatch}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-sismo_admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow_secure_admin_2026}
+      _AIRFLOW_WWW_USER_FIRSTNAME: Sismo
+      _AIRFLOW_WWW_USER_LASTNAME: Admin
+      _AIRFLOW_WWW_USER_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@sismowatch.internal}
+      _AIRFLOW_WWW_USER_ROLE: Admin
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate && \
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-sismo_admin}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-airflow_secure_admin_2026}" \
+          --firstname Sismo \
+          --lastname Admin \
+          --role Admin \
+          --email "${AIRFLOW_ADMIN_EMAIL:-admin@sismowatch.internal}" || true
+    networks:
+      - sismowatch_net
+
+  airflow-webserver:
+    build:
+      context: ./airflow
+    container_name: sismowatch_airflow_webserver
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-sismowatch}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-sismowatch}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_secure_pass_2026}
+      SISMO_INGEST_PASSWORD: ${SISMO_INGEST_PASSWORD:-ingest_secret_pass_2026}
+      SISMO_ETL_PASSWORD: ${SISMO_ETL_PASSWORD:-etl_secret_pass_2026}
+      SISMO_APP_PASSWORD: ${SISMO_APP_PASSWORD:-app_readonly_pass_2026}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-sismowatch-lake}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minio_admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minio_secret_pass_2026}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5}
+      USGS_REALTIME_URL: ${USGS_REALTIME_URL:-https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson}
+      USGS_QUERY_BASE_URL: ${USGS_QUERY_BASE_URL:-https://earthquake.usgs.gov/fdsnws/event/1/query}
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/include:/opt/airflow/include
+      - airflow_logs:/opt/airflow/logs
+    command: airflow webserver
+    networks:
+      - sismowatch_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  airflow-scheduler:
+    build:
+      context: ./airflow
+    container_name: sismowatch_airflow_scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-sismowatch}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-sismowatch}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_secure_pass_2026}
+      SISMO_INGEST_PASSWORD: ${SISMO_INGEST_PASSWORD:-ingest_secret_pass_2026}
+      SISMO_ETL_PASSWORD: ${SISMO_ETL_PASSWORD:-etl_secret_pass_2026}
+      SISMO_APP_PASSWORD: ${SISMO_APP_PASSWORD:-app_readonly_pass_2026}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-sismowatch-lake}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-minio_admin}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-minio_secret_pass_2026}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11435}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3:latest}
+      USGS_REALTIME_URL: ${USGS_REALTIME_URL:-https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson}
+      USGS_QUERY_BASE_URL: ${USGS_QUERY_BASE_URL:-https://earthquake.usgs.gov/fdsnws/event/1/query}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/include:/opt/airflow/include
+      - airflow_logs:/opt/airflow/logs
+    command: airflow scheduler
+    networks:
+      - sismowatch_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ====================================================================
+  # 4. BACKEND API REST & SSE (FastAPI con rol sismo_app de solo lectura)
+  # ====================================================================
+  api:
+    build:
+      context: ./api
+    container_name: sismowatch_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-sismowatch}
+      POSTGRES_USER: ${SISMO_APP_USER:-sismo_app}
+      POSTGRES_PASSWORD: ${SISMO_APP_PASSWORD:-app_readonly_pass_2026}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-sismowatch_jwt_super_secret_key_2026_change_in_prod}
+      AIRFLOW_API_URL: http://airflow-webserver:8080/api/v1
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-sismo_admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow_secure_admin_2026}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3:latest}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./api:/app
+    networks:
+      - sismowatch_net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ====================================================================
+  # 5. PLATAFORMA WEB FRONTEND (React + Vite + Leaflet + Nginx)
+  # ====================================================================
+  web:
+    build:
+      context: ./web
+    container_name: sismowatch_web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    networks:
+      - sismowatch_net
+
+# ====================================================================
+# VOLÚMENES PERSISTENTES Y REDES
+# ====================================================================
+volumes:
+  postgres_data:
+  minio_data:
+  airflow_logs:
+
+networks:
+  sismowatch_net:
+    driver: bridge

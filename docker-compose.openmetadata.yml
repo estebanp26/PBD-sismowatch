@@ -1,0 +1,86 @@
+version: '3.8'
+
+# ====================================================================
+# SismoWatch: Stack Opcional de Gobierno y Linaje con OpenMetadata
+# Puerto de interfaz OpenMetadata: http://localhost:8585
+# Para levantar: docker compose -f docker-compose.openmetadata.yml up -d
+# ====================================================================
+
+services:
+  # 1. Base de datos interna de OpenMetadata (MySQL)
+  openmetadata-mysql:
+    image: mysql:8.0.35
+    container_name: sismowatch_openmetadata_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: openmetadata_root_pass
+      MYSQL_DATABASE: openmetadata_db
+      MYSQL_USER: openmetadata_user
+      MYSQL_PASSWORD: openmetadata_password
+    volumes:
+      - openmetadata_mysql_data:/var/lib/mysql
+    networks:
+      - sismowatch_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 2. Motor de búsqueda y catálogo OpenSearch
+  openmetadata-opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: sismowatch_openmetadata_search
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - openmetadata_search_data:/usr/share/opensearch/data
+    networks:
+      - sismowatch_net
+
+  # 3. Servidor OpenMetadata (UI y Catálogo de Linaje de Datos)
+  openmetadata-server:
+    image: docker.getcollate.io/openmetadata/server:1.3.2
+    container_name: sismowatch_openmetadata_server
+    restart: unless-stopped
+    depends_on:
+      openmetadata-mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: openmetadata-mysql
+      DB_PORT: 3306
+      DB_USER: openmetadata_user
+      DB_PASSWORD: openmetadata_password
+      DB_DATABASE: openmetadata_db
+      SEARCH_TYPE: opensearch
+      SEARCH_HOST: openmetadata-opensearch
+      SEARCH_PORT: 9200
+      SEARCH_SCHEME: http
+      AUTHENTICATION_PROVIDER: no-auth
+      AUTHORIZATION_ADMIN_USERS: admin
+    ports:
+      - "8585:8585"
+    networks:
+      - sismowatch_net
+
+volumes:
+  openmetadata_mysql_data:
+    name: sismowatch_openmetadata_mysql_data
+  openmetadata_search_data:
+    name: sismowatch_openmetadata_search_data
+
+networks:
+  sismowatch_net:
+    external: true
+    name: pbd-sismowatch_sismowatch_net
